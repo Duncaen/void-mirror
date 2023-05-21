@@ -8,6 +8,8 @@ dynamic "repository" {
     "/current/debug",
     "/current/nonfree",
     "/current/multilib",
+    "/current/multilib/nonfree",
+    "/current/multilib/bootstrap",
     "/current/bootstrap",
   ]
   iterator = path
@@ -22,7 +24,6 @@ dynamic "repository" {
     "/current/musl",
     "/current/musl/debug",
     "/current/musl/nonfree",
-    "/current/musl/multilib",
     "/current/musl/bootstrap",
   ]
   iterator = path
@@ -37,7 +38,6 @@ dynamic "repository" {
     "/current/aarch64",
     "/current/aarch64/debug",
     "/current/aarch64/nonfree",
-    "/current/aarch64/multilib",
     "/current/aarch64/bootstrap",
   ]
   iterator = path
