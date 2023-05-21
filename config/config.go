@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
+    "github.com/zclconf/go-cty/cty/function/stdlib"
+    "github.com/zclconf/go-cty/cty/function"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/ext/dynblock"
@@ -21,8 +23,8 @@ type Config struct {
 }
 
 type RepositoryConfig struct {
-	Upstream string   `hcl:"upstream"`
-	Archs    []string `hcl:"archs"`
+	Upstream     string `hcl:"upstream"`
+	Architecture string `hcl:"architecture"`
 }
 
 type local struct {
@@ -75,7 +77,15 @@ func (c *Config) Load(filename string) error {
 	if diags.HasErrors() {
 		return diags
 	}
-	body := dynblock.Expand(file.Body, nil)
+	ctx := hcl.EvalContext{
+        Variables: make(map[string]cty.Value),
+        Functions: map[string]function.Function{
+            "concat": stdlib.ConcatFunc,
+            "flatten": stdlib.FlattenFunc,
+            "merge": stdlib.MergeFunc,
+        },
+    }
+	body := dynblock.Expand(file.Body, &ctx)
 
 	content, remaining, diags := body.PartialContent(&hcl.BodySchema{
 		Blocks: []hcl.BlockHeaderSchema{
@@ -87,7 +97,6 @@ func (c *Config) Load(filename string) error {
 	if diags.HasErrors() {
 		return diags
 	}
-	ctx := hcl.EvalContext{Variables: make(map[string]cty.Value)}
 	for _, block := range content.Blocks {
 		switch block.Type {
 		case "locals":
