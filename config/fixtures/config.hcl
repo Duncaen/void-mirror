@@ -30,11 +30,15 @@ locals {
   ]
 }
 
+jobs = 8
+
 dynamic "repository" {
   for_each = flatten(concat(glibc, multilib, musl, aarch64))
   iterator = repo
   content {
     upstream = "${upstream}/${repo.value.path}"
+    interval = "30s"
     architecture = "${repo.value.arch}"
+    destination = "/srv/www/${repo.value.path}"
   }
 }

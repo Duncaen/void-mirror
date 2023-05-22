@@ -3,13 +3,15 @@ package config
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/zclconf/go-cty/cty"
-    "github.com/zclconf/go-cty/cty/function/stdlib"
-    "github.com/zclconf/go-cty/cty/function"
+	"github.com/zclconf/go-cty/cty/function"
+	"github.com/zclconf/go-cty/cty/function/stdlib"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/ext/dynblock"
@@ -19,12 +21,8 @@ import (
 )
 
 type Config struct {
-	Repositories []RepositoryConfig `hcl:"repository,block"`
-}
-
-type RepositoryConfig struct {
-	Upstream     string `hcl:"upstream"`
-	Architecture string `hcl:"architecture"`
+	Repositories []*RepositoryConfig `hcl:"repository,block"`
+	Jobs         int                 `hcl:"jobs,optional"`
 }
 
 type local struct {
@@ -54,6 +52,53 @@ func decodeLocalsBlock(block *hcl.Block) ([]*local, hcl.Diagnostics) {
 	return locals, diags
 }
 
+type RepositoryConfig struct {
+	Upstream     *url.URL
+	Destination  string
+	Architecture string
+	Interval     *time.Duration
+}
+
+func decodeRepositoryBlock(block *hcl.Block, ctx *hcl.EvalContext) (*RepositoryConfig, hcl.Diagnostics) {
+	var data struct {
+		Upstream     string `hcl:"upstream"`
+		Destination  string `hcl:"destination"`
+		Architecture string `hcl:"architecture"`
+		Interval     string `hcl:"interval,optional"`
+	}
+	diags := gohcl.DecodeBody(block.Body, ctx, &data)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	repo := &RepositoryConfig{
+		Destination:  data.Destination,
+		Architecture: data.Architecture,
+	}
+	var err error
+	repo.Upstream, err = url.Parse(data.Upstream)
+	if err != nil {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid upstream",
+			Detail:   fmt.Sprintf("Invalid upstream: %q: %v", data.Upstream, err),
+		})
+		return nil, diags
+	}
+	if data.Interval != "" {
+		interval, err := time.ParseDuration(data.Interval)
+		if err != nil {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid interval",
+				Detail:   fmt.Sprintf("Invalid interval: %q: %v", data.Interval, err),
+			})
+			return nil, diags
+		}
+		repo.Interval = &interval
+	}
+	return repo, diags
+}
+
 func (c *Config) Load(filename string) error {
 	var file *hcl.File
 	var diags hcl.Diagnostics
@@ -78,13 +123,13 @@ func (c *Config) Load(filename string) error {
 		return diags
 	}
 	ctx := hcl.EvalContext{
-        Variables: make(map[string]cty.Value),
-        Functions: map[string]function.Function{
-            "concat": stdlib.ConcatFunc,
-            "flatten": stdlib.FlattenFunc,
-            "merge": stdlib.MergeFunc,
-        },
-    }
+		Variables: make(map[string]cty.Value),
+		Functions: map[string]function.Function{
+			"concat":  stdlib.ConcatFunc,
+			"flatten": stdlib.FlattenFunc,
+			"merge":   stdlib.MergeFunc,
+		},
+	}
 	body := dynblock.Expand(file.Body, &ctx)
 
 	content, remaining, diags := body.PartialContent(&hcl.BodySchema{
@@ -113,10 +158,43 @@ func (c *Config) Load(filename string) error {
 			}
 		}
 	}
-	diags = gohcl.DecodeBody(remaining, &ctx, c)
+	content, diags = remaining.Content(&hcl.BodySchema{
+		Attributes: []hcl.AttributeSchema{
+			{
+				Name: "jobs",
+			},
+		},
+		Blocks: []hcl.BlockHeaderSchema{
+			{
+				Type: "repository",
+			},
+		},
+	})
 	if diags.HasErrors() {
 		return diags
 	}
+
+	for _, block := range content.Blocks {
+		switch block.Type {
+		case "repository":
+			repo, diags := decodeRepositoryBlock(block, &ctx)
+			if diags.HasErrors() {
+				return diags
+			}
+			c.Repositories = append(c.Repositories, repo)
+		}
+	}
+	for name, attr := range content.Attributes {
+		switch name {
+		case "jobs":
+			diags := gohcl.DecodeExpression(attr.Expr, &ctx, &c.Jobs)
+			if diags.HasErrors() {
+				return diags
+			}
+		}
+
+	}
+
 	if len(diags) > 0 {
 		log.Println(diags)
 	}
