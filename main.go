@@ -152,7 +152,7 @@ func (h *digest) UnmarshalPlist(unmarshal func(interface{}) error) error {
 	}
 	data, err := hex.DecodeString(s)
 	if err != nil {
-		return fmt.Errorf("could not decode digest", err)
+		return fmt.Errorf("could not decode digest: %v", err)
 	}
 	*h = data
 	return nil
