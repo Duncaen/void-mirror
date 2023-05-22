@@ -99,12 +99,18 @@ func decodeRepositoryBlock(block *hcl.Block, ctx *hcl.EvalContext) (*RepositoryC
 	return repo, diags
 }
 
-func (c *Config) Load(filename string) error {
+func (c *Config) Load(filename string) hcl.Diagnostics {
 	var file *hcl.File
 	var diags hcl.Diagnostics
 	src, err := os.ReadFile(filename)
 	if err != nil {
-		return err
+		return hcl.Diagnostics{
+			{
+				Severity: hcl.DiagError,
+				Summary:  "Could not read file",
+				Detail:   fmt.Sprintf("Could not read file: %v", err),
+			},
+		}
 	}
 	switch suffix := strings.ToLower(filepath.Ext(filename)); suffix {
 	case ".hcl":
