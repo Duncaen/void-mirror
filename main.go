@@ -64,35 +64,6 @@ func NewStagedata(config *config.RepositoryConfig) (*Stagedata, error) {
 	return &Stagedata{config: config, req: req, index: idx}, nil
 }
 
-type tmpfile struct {
-	file *os.File
-}
-
-func Tempfile(dir, pattern string) (*tmpfile, error) {
-	file, err := os.CreateTemp(dir, pattern)
-	if err != nil {
-		return nil, err
-	}
-	return &tmpfile{file}, nil
-}
-func (t *tmpfile) Remove() error {
-	if t.file == nil {
-		return nil
-	}
-	t.file.Close()
-	return os.Remove(t.file.Name())
-}
-func (t *tmpfile) Commit(path string) error {
-	if err := t.file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(t.file.Name(), path); err != nil {
-		return err
-	}
-	t.file = nil
-	return nil
-}
-
 func fetchRepodata(ctx context.Context, req *http.Request, dir string, file string) (*http.Response, error) {
 	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
