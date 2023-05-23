@@ -6,6 +6,31 @@ Simple daemon that mirrors xbps repositories.
 
 The configuration is loaded from `config.hcl` or a hcl or json file specified using the `-conffile` flag.
 
+```hcl
+jobs = 8
+
+repository {
+    upstream = "https://repo-de.voidlinux.org/current"
+    interval = "30s"
+    architecture = "x86_64"
+    destination = "/srv/www/current"
+}
+
+repository {
+    upstream = "https://repo-de.voidlinux.org/current/nonfree"
+    interval = "30s"
+    architecture = "x86_64"
+    destination = "/srv/www/current/nonfree"
+}
+
+repository {
+    upstream = "https://repo-de.voidlinux.org/current/multilib"
+    interval = "30s"
+    architecture = "x86_64"
+    destination = "/srv/www/current/multilib"
+}
+```
+
 Example configuration to mirror all repositories:
 
 ```hcl
