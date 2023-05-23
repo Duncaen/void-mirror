@@ -19,6 +19,9 @@ import (
 
 	"github.com/carlmjohnson/requests"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/Duncaen/go-xbps/repo/repodata"
 
 	"github.com/void-linux/void-mirror/config"
@@ -27,7 +30,62 @@ import (
 
 var (
 	conffile = flag.String("conffile", "config.hcl", "configuration file path")
+	listenaddr = flag.String("listen", ":9998", "listen address")
 )
+
+var (
+	namespace = "void_mirror"
+	download_bytes_total = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "download_bytes_total",
+			Help:      "Bytes downloaded (total)",
+		},
+	)
+	responses_total = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "response_total",
+			Help:      "Total number of responses by status code",
+		},
+		[]string{"code"},
+	)
+	queue_running = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "queue_running",
+			Help:      "Number of queue jobs currently running",
+		},
+	)
+	queue_workers = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "queue_workers",
+			Help:      "Number of workers",
+		},
+	)
+)
+
+var (
+	transport = requests.LogTransport(http.DefaultClient.Transport, requestLogger)
+)
+
+func requestLogger(req *http.Request, res *http.Response, err error, d time.Duration) {
+	slog.Debug("request",
+		slog.Group("req",
+			"url", req.URL,
+			"method", req.Method,
+		),
+		slog.Group("resp",
+			"status", res.StatusCode,
+			"length", res.ContentLength,
+		),
+		"duration", d,
+		"error", err,
+	)
+	responses_total.WithLabelValues(fmt.Sprintf("%d", res.StatusCode)).Add(1)
+	download_bytes_total.Add(float64(res.ContentLength))
+}
 
 func updateRequestConditions(req *http.Request, resp *http.Response) {
 	if value := resp.Header.Get("Last-Modified"); value != "" {
@@ -142,8 +200,8 @@ func (data *Stagedata) Update(ctx context.Context) (*indexDiff, error) {
 	pattern := fmt.Sprintf(".%s-stagedata.*", data.config.Architecture)
 	url := data.config.Upstream.JoinPath(file)
 	var tmpfile string
-	slog.Debug("updating stagedata", "url", url.String())
 	err := requests.URL(url.String()).
+		Transport(transport).
 		Header("If-Modified-Since", data.LastModified).
 		Header("If-None-Match", data.ETag).
 		CheckStatus(http.StatusOK).
@@ -220,9 +278,9 @@ func (data *Repodata) Update(ctx context.Context) (*indexDiff, error) {
 	file := fmt.Sprintf("%s-repodata", data.config.Architecture)
 	pattern := fmt.Sprintf(".%s-repodata.*", data.config.Architecture)
 	url := data.config.Upstream.JoinPath(file)
-	slog.Debug("updating repodata", "url", url.String())
 	var tmpfile string
 	err := requests.URL(url.String()).
+		Transport(transport).
 		Handle(reqextra.ToTemp(data.config.Destination, pattern, &tmpfile)).
 		Fetch(ctx)
 	if err != nil {
@@ -266,6 +324,8 @@ type Repository struct {
 
 func (r *Repository) queue(req *requests.Builder) {
 	wp.Submit(func() {
+		queue_running.Inc()
+		defer queue_running.Dec()
 		url, err := req.URL()
 		if err != nil {
 			slog.Error("url error", "error", err)
@@ -283,8 +343,8 @@ func (r *Repository) queuePkg(pkg *pkg) error {
 	binpkg := pkg.Filename()
 	url := r.Config.Upstream.JoinPath(binpkg)
 	path := filepath.Join(r.Config.Destination, binpkg)
-	r.queue(requests.
-		URL(url.String()).
+	r.queue(requests.URL(url.String()).
+		Transport(transport).
 		Handle(reqextra.Sha256Verify(pkg.SHA256, reqextra.ToFileAtomic(path))))
 	return nil
 }
@@ -404,6 +464,18 @@ func (r *Repository) Run(ctx context.Context) error {
 
 var wp *workerpool.WorkerPool
 
+type collector struct {
+	queueWaiting *prometheus.Desc
+}
+
+func (c *collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.queueWaiting
+}
+
+func (c *collector) Collect(ch chan<- prometheus.Metric) {
+	ch <- prometheus.MustNewConstMetric(c.queueWaiting, prometheus.GaugeValue, float64(wp.WaitingQueueSize()))
+}
+
 func main() {
 	flag.Parse()
 	opts := &slog.HandlerOptions{
@@ -429,6 +501,7 @@ func main() {
 		os.Exit(1)
 	}
 	wp = workerpool.New(conf.Jobs)
+	queue_workers.Set(float64(conf.Jobs))
 
 	repos := []*Repository{}
 	g, ctx := errgroup.WithContext(context.Background())
@@ -443,6 +516,23 @@ func main() {
 		})
 		repos = append(repos, repo)
 	}
+	prometheus.MustRegister(&collector{
+		queueWaiting: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "", "queue_waiting"),
+			"Queue waiting size",
+			nil,
+			nil,
+		),
+	})
+	prometheus.MustRegister(download_bytes_total)
+	prometheus.MustRegister(responses_total)
+	prometheus.MustRegister(queue_running)
+	prometheus.MustRegister(queue_workers)
+
+	http.Handle("/metrics", promhttp.Handler())
+	g.Go(func() error {
+		return http.ListenAndServe(*listenaddr, nil)
+	})
 
 	err := g.Wait()
 	if err != nil {
