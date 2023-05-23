@@ -1,30 +1,28 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"hash"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/exp/slog"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/hashicorp/hcl/v2"
 
 	"github.com/gammazero/workerpool"
 
+	"github.com/carlmjohnson/requests"
+
 	"github.com/Duncaen/go-xbps/repo/repodata"
 
 	"github.com/void-linux/void-mirror/config"
+	"github.com/void-linux/void-mirror/reqextra"
 )
 
 var (
@@ -48,6 +46,8 @@ type Stagedata struct {
 	config *config.RepositoryConfig
 	req    *http.Request
 	index  index
+	ETag string
+	LastModified string
 }
 
 func NewStagedata(config *config.RepositoryConfig) (*Stagedata, error) {
@@ -62,56 +62,6 @@ func NewStagedata(config *config.RepositoryConfig) (*Stagedata, error) {
 		return nil, err
 	}
 	return &Stagedata{config: config, req: req, index: idx}, nil
-}
-
-func fetchRepodata(ctx context.Context, req *http.Request, dir string, file string) (*http.Response, error) {
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-	if err != nil {
-		return resp, err
-	}
-	defer resp.Body.Close()
-
-	slog.Debug("request", slog.Group("req", "url", req.URL), slog.Group("resp", "status", resp.StatusCode))
-
-	if resp.StatusCode != http.StatusOK {
-		return resp, nil
-	}
-
-	pattern := fmt.Sprintf(".%s.*", file)
-	tmpfile, err := Tempfile(dir, pattern)
-	if err != nil {
-		slog.Error("creating tempfile failed", "error", err)
-		return resp, err
-	}
-	defer tmpfile.Remove()
-
-	tmpfilename := tmpfile.file.Name()
-	_, err = io.Copy(tmpfile.file, resp.Body)
-	if err != nil {
-		slog.Error("writing repodata file failed", "error", err)
-		return resp, err
-	}
-	if err := resp.Body.Close(); err != nil {
-		slog.Error("closing response body failed", "error", err)
-	}
-
-	// set the modtime on the temporary file
-	if value := resp.Header.Get("Last-Modified"); value != "" {
-		if date, err := time.Parse(http.TimeFormat, value); err == nil {
-			if err := os.Chtimes(tmpfilename, time.Now(), date); err != nil {
-				slog.Error("changing mod time failed", "path", tmpfilename, "error", err)
-			}
-		}
-	}
-
-	// everything fine, rename the temporary file
-	destfile := filepath.Join(dir, file)
-	if err := tmpfile.Commit(destfile); err != nil {
-		slog.Error("renaming tempfile", "oldpath", tmpfilename, "newpath", destfile, "error", err)
-		return resp, err
-	}
-
-	return resp, nil
 }
 
 type digest []byte
@@ -189,52 +139,67 @@ func readRepodata(path string) (index, error) {
 
 func (data *Stagedata) Update(ctx context.Context) (*indexDiff, error) {
 	file := fmt.Sprintf("%s-stagedata", data.config.Architecture)
-	resp, err := fetchRepodata(ctx, data.req, data.config.Destination, file)
+	pattern := fmt.Sprintf(".%s-stagedata.*", data.config.Architecture)
+	url := data.config.Upstream.JoinPath(file)
+	var tmpfile string
+	slog.Debug("updating stagedata", "url", url.String())
+	err := requests.URL(url.String()).
+		Header("If-Modified-Since", data.LastModified).
+		Header("If-None-Match", data.ETag).
+		CheckStatus(http.StatusOK).
+		Handle(requests.ChainHandlers(
+			reqextra.CopyCacheHeaders(&data.ETag, &data.LastModified),
+			reqextra.ToTemp(data.config.Destination, pattern, &tmpfile),
+		)).Fetch(ctx)
 	if err != nil {
-		return nil, err
-	}
-	switch resp.StatusCode {
-	case http.StatusNotModified:
-		return nil, nil
-	case http.StatusOK:
-		path := filepath.Join(data.config.Destination, file)
-		index, err := readRepodata(path)
-		if err != nil {
-			slog.Error("invalid stagedata", "path", path, "error", err)
-			if err := os.Remove(path); err != nil {
+		if tmpfile != "" {
+			os.Remove(tmpfile)
+		}
+		if requests.HasStatusErr(err, http.StatusNotFound) {
+			if data.index == nil {
+				return nil, nil
+			}
+			// 404 for stagedata is different from repodata, we delete the file
+			// and return an empty index.
+			if err := os.Remove(filepath.Join(data.config.Destination, file)); err != nil {
 				if !os.IsNotExist(err) {
-					slog.Error("could not delete invalid stagedata", "path", path, "error", err)
+					return nil, err
 				}
 			}
+			data.index = nil
+			return &indexDiff{}, nil
+		} else if requests.HasStatusErr(err, http.StatusNotModified) {
 			return nil, nil
 		}
-		diff := data.index.Diff(index)
-		data.index = index
-		updateRequestConditions(data.req, resp)
-		return &diff, nil
-	case http.StatusNotFound:
-		if data.index == nil {
-			return nil, nil
-		}
-		// 404 for stagedata is different from repodata, we delete the file
-		// and return an empty index.
-		if err := os.Remove(filepath.Join(data.config.Destination, file)); err != nil {
+		return nil, err
+	}
+
+	path := filepath.Join(data.config.Destination, file)
+	index, err := readRepodata(tmpfile)
+	if err != nil {
+		slog.Error("invalid stagedata", "path", path, "error", err)
+		if err := os.Remove(path); err != nil {
 			if !os.IsNotExist(err) {
-				return nil, err
+				slog.Error("could not delete invalid stagedata", "path", path, "error", err)
 			}
 		}
-		data.index = nil
-		return &indexDiff{}, nil
-	default:
-		slog.Error("unexpected status code", "url", data.req.URL, "status", resp.StatusCode)
-		return nil, nil
+		os.Remove(tmpfile)
+		return nil, err
 	}
+	diff := data.index.Diff(index)
+	data.index = index
+	if err := os.Rename(tmpfile, path); err != nil {
+		return &diff, err
+	}
+	return &diff, nil
 }
 
 type Repodata struct {
 	config *config.RepositoryConfig
 	req    *http.Request
 	index  index
+	ETag string
+	LastModified string
 }
 
 func NewRepodata(config *config.RepositoryConfig) (*Repodata, error) {
@@ -253,36 +218,39 @@ func NewRepodata(config *config.RepositoryConfig) (*Repodata, error) {
 
 func (data *Repodata) Update(ctx context.Context) (*indexDiff, error) {
 	file := fmt.Sprintf("%s-repodata", data.config.Architecture)
-	resp, err := fetchRepodata(ctx, data.req, data.config.Destination, file)
+	pattern := fmt.Sprintf(".%s-repodata.*", data.config.Architecture)
+	url := data.config.Upstream.JoinPath(file)
+	slog.Debug("updating repodata", "url", url.String())
+	var tmpfile string
+	err := requests.URL(url.String()).
+		Handle(reqextra.ToTemp(data.config.Destination, pattern, &tmpfile)).
+		Fetch(ctx)
 	if err != nil {
-		return nil, err
-	}
-	switch resp.StatusCode {
-	case http.StatusNotModified:
-		return nil, nil
-	case http.StatusOK:
-		path := filepath.Join(data.config.Destination, file)
-		index, err := readRepodata(path)
-		if err != nil {
-			slog.Error("invalid repodata", "path", path, "error", err)
-			if err := os.Remove(path); err != nil {
-				if !os.IsNotExist(err) {
-					slog.Error("could not delete invalid repodata", "path", path, "error", err)
-				}
-			}
+		if tmpfile != "" {
+			os.Remove(tmpfile)
+		}
+		if requests.HasStatusErr(err, http.StatusNotModified) {
 			return nil, nil
 		}
-		diff := data.index.Diff(index)
-		data.index = index
-		updateRequestConditions(data.req, resp)
-		return &diff, nil
-	case http.StatusNotFound:
-		slog.Error("repodata not found", "url", data.req.URL, "status", resp.StatusCode)
-		return nil, nil
-	default:
-		slog.Error("unexpected status code", "url", data.req.URL, "status", resp.StatusCode)
+		return nil, err
+	}
+	path := filepath.Join(data.config.Destination, file)
+	index, err := readRepodata(tmpfile)
+	if err != nil {
+		slog.Error("invalid repodata", "path", path, "error", err)
+		if err := os.Remove(path); err != nil {
+			if !os.IsNotExist(err) {
+				slog.Error("could not delete invalid repodata", "path", path, "error", err)
+			}
+		}
 		return nil, nil
 	}
+	diff := data.index.Diff(index)
+	data.index = index
+	if err := os.Rename(tmpfile, path); err != nil {
+		return &diff, err
+	}
+	return &diff, nil
 }
 
 type Repository struct {
@@ -291,36 +259,44 @@ type Repository struct {
 	Stagedata *Stagedata
 	ticker    *time.Ticker
 	req       *http.Request
-	downloads map[*Download]struct{}
 	files     map[string]struct{}
 	obsolete  map[string]time.Time
-	results   chan DownloadResult
 	ctx       context.Context
 }
 
-func (r *Repository) queue(download Download) {
-	dl := &download
-	r.downloads[dl] = struct{}{}
+func (r *Repository) queue(req *requests.Builder) {
 	wp.Submit(func() {
-		err := dl.Download(r.ctx, r.req)
-		r.results <- DownloadResult{dl, err}
+		url, err := req.URL()
+		if err != nil {
+			slog.Error("url error", "error", err)
+			return
+		}
+		slog.Info("downloading", "url", url)
+		err = req.Fetch(r.ctx)
+		if err != nil {
+			slog.Error("donwloading", "error", err)
+		}
 	})
 }
 
-func (r *Repository) queuePkg(pkg *pkg) {
+func (r *Repository) queuePkg(pkg *pkg) error {
 	binpkg := pkg.Filename()
-	r.queue(Download{
-		URL:       r.Config.Upstream.JoinPath(binpkg),
-		Filename:  binpkg,
-		Directory: r.Config.Destination,
-		SHA256:    pkg.SHA256,
-	})
-	sigfile := binpkg + ".sig"
-	r.queue(Download{
-		URL:       r.Config.Upstream.JoinPath(sigfile),
-		Filename:  sigfile,
-		Directory: r.Config.Destination,
-	})
+	url := r.Config.Upstream.JoinPath(binpkg)
+	path := filepath.Join(r.Config.Destination, binpkg)
+	r.queue(requests.
+		URL(url.String()).
+		Handle(reqextra.Sha256Verify(pkg.SHA256, reqextra.ToFileAtomic(path))))
+	return nil
+}
+
+func (r *Repository) queueSig(pkg *pkg) error {
+	sigfile := pkg.Filename() + ".sig"
+	path := filepath.Join(r.Config.Destination, sigfile)
+	url := r.Config.Upstream.JoinPath(sigfile)
+	r.queue(requests.
+		URL(url.String()).
+		Handle(reqextra.ToFileAtomic(path)))
+	return nil
 }
 
 func NewRepository(ctx context.Context, config *config.RepositoryConfig) (*Repository, error) {
@@ -328,8 +304,6 @@ func NewRepository(ctx context.Context, config *config.RepositoryConfig) (*Repos
 		Config: config,
 		files:     make(map[string]struct{}),
 		obsolete:  make(map[string]time.Time),
-		downloads: make(map[*Download]struct{}),
-		results:   make(chan DownloadResult),
 		ctx:       ctx,
 	}
 	var err error
@@ -355,23 +329,18 @@ func NewRepository(ctx context.Context, config *config.RepositoryConfig) (*Repos
 			if !os.IsNotExist(err) {
 				return nil, err
 			}
-			r.queue(Download{
-				URL:       config.Upstream.JoinPath(binpkg),
-				Filename:  binpkg,
-				Directory: config.Destination,
-				SHA256:    pkg.SHA256,
-			})
+			if err := r.queuePkg(pkg); err != nil {
+				return nil, err
+			}
 		}
 		sigfile := binpkg + ".sig"
 		if _, err := os.Stat(filepath.Join(config.Destination, sigfile)); err != nil {
 			if !os.IsNotExist(err) {
 				return nil, err
 			}
-			r.queue(Download{
-				URL:       config.Upstream.JoinPath(sigfile),
-				Filename:  sigfile,
-				Directory: config.Destination,
-			})
+			if err := r.queueSig(pkg); err != nil {
+				return nil, err
+			}
 		}
 		r.files[binpkg] = struct{}{}
 		r.files[sigfile] = struct{}{}
@@ -427,8 +396,6 @@ func (r *Repository) Run(ctx context.Context) error {
 			if err := r.update(ctx); err != nil {
 				return err
 			}
-		case _ = <-r.results:
-			// XXX: requeue failed downloads
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -440,6 +407,7 @@ var wp *workerpool.WorkerPool
 func main() {
 	flag.Parse()
 	opts := &slog.HandlerOptions{
+		AddSource: true,
 		Level: slog.LevelDebug,
 	}
 	textHandler := slog.NewTextHandler(os.Stdout, opts)

@@ -4,6 +4,7 @@ go 1.20
 
 require (
 	github.com/Duncaen/go-xbps v0.0.0-20220829111410-3a8ed2143da3
+	github.com/carlmjohnson/requests v0.23.4
 	github.com/gammazero/workerpool v1.1.3
 	github.com/hashicorp/hcl/v2 v2.16.2
 	github.com/zclconf/go-cty v1.12.1
@@ -20,6 +21,7 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/mitchellh/go-wordwrap v0.0.0-20150314170334-ad45545899c7 // indirect
 	github.com/rogpeppe/go-internal v1.10.0 // indirect
+	golang.org/x/net v0.7.0 // indirect
 	golang.org/x/text v0.7.0 // indirect
 	howett.net/plist v1.0.0 // indirect
 )
